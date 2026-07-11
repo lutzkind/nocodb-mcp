@@ -10,6 +10,7 @@ import { registerDocsTools } from './tools/docs.js';
 import { registerFieldTools } from './tools/fields.js';
 import { registerFilterTools } from './tools/filters.js';
 import { registerImportExportTools } from './tools/import-export.js';
+import { registerMetadataResolutionTools } from './tools/metadata-resolution.js';
 import { registerLinkTools } from './tools/links.js';
 import { registerPingTool } from './tools/ping.js';
 import { registerRecordTools } from './tools/records.js';
@@ -20,6 +21,7 @@ import { registerTableTools } from './tools/tables.js';
 import { registerViewTools } from './tools/views.js';
 import { registerWebhookTools } from './tools/webhooks.js';
 import { registerWorkflowTools } from './tools/workflows.js';
+import { registerRecordHistoryTools } from './tools/history.js';
 import { registerWorkspaceTools } from './tools/workspaces.js';
 
 export const SERVER_VERSION = '1.0.4';
@@ -36,6 +38,7 @@ export function createServer(config: NocoDBConfig): McpServer {
   registerPingTool(server, client, config);
   registerWorkspaceTools(server, client);
   registerBaseTools(server, client);
+  registerMetadataResolutionTools(server, client);
   registerTableTools(server, client);
   registerFieldTools(server, client);
   registerRecordTools(server, client);
@@ -48,6 +51,7 @@ export function createServer(config: NocoDBConfig): McpServer {
   registerImportExportTools(server, client);
   registerSchemaOpsTools(server, client);
   registerCommentTools(server, client);
+  registerRecordHistoryTools(server, client);
   registerScriptTools(server, client);
   registerDashboardTools(server, client);
   registerWorkflowTools(server, client);
