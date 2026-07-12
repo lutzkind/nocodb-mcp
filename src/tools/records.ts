@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import type { NocoDBClient } from '../client.js';
@@ -7,6 +8,87 @@ import { dryRunPreview, tryTool } from './helpers.js';
 const recordSchema = z
   .record(z.string(), z.unknown())
   .describe('Object: { field_title: value, ... }');
+const AUDIT_LOG_PATH = '/tmp/nocodb-mcp-audit.jsonl';
+const MAX_BATCH_SIZE = 200;
+const MAX_ID_SCAN = 20000;
+const DEFAULT_SAMPLE_SIZE = 10;
+
+function appendAuditLog(entry: Record<string, unknown>): void {
+  fs.appendFileSync(
+    AUDIT_LOG_PATH,
+    `${JSON.stringify({ timestamp: new Date().toISOString(), ...entry })}\n`,
+    'utf8',
+  );
+}
+
+function chunkArray<T>(items: T[], size: number): T[][] {
+  const chunks: T[][] = [];
+  for (let index = 0; index < items.length; index += size) {
+    chunks.push(items.slice(index, index + size));
+  }
+  return chunks;
+}
+
+function recordIdValue(record: Record<string, unknown>): string | number | null {
+  const id = record.Id;
+  if (typeof id === 'string' || typeof id === 'number') {
+    return id;
+  }
+  return null;
+}
+
+async function countMatchingRecords(
+  client: NocoDBClient,
+  baseId: string,
+  tableId: string,
+  where?: string,
+): Promise<number> {
+  const count = await client.request<number | { count?: number; value?: number }>(
+    `/data/${baseId}/${tableId}/count`,
+    { query: { where } },
+  );
+
+  if (typeof count === 'number') return count;
+  if (typeof count.count === 'number') return count.count;
+  if (typeof count.value === 'number') return count.value;
+  return 0;
+}
+
+async function listMatchingRecordIds(
+  client: NocoDBClient,
+  baseId: string,
+  tableId: string,
+  where: string | undefined,
+  limit: number,
+): Promise<Array<string | number>> {
+  const ids: Array<string | number> = [];
+  let offset = 0;
+  const pageSize = Math.min(MAX_BATCH_SIZE, Math.max(limit, 1));
+
+  while (ids.length < limit) {
+    const page = await client.request<{ list?: Array<Record<string, unknown>> }>(
+      `/data/${baseId}/${tableId}/records`,
+      {
+        query: {
+          where,
+          fields: 'Id',
+          limit: Math.min(pageSize, limit - ids.length),
+          offset,
+        },
+      },
+    );
+    const records = page.list ?? [];
+    if (records.length === 0) break;
+    for (const record of records) {
+      const id = recordIdValue(record);
+      if (id !== null) ids.push(id);
+    }
+    if (records.length < pageSize) break;
+    offset += records.length;
+  }
+
+  return ids;
+}
 
 export function registerRecordTools(server: McpServer, client: NocoDBClient): void {
   server.registerTool(
@@ -204,6 +286,173 @@ export function registerRecordTools(server: McpServer, client: NocoDBClient): vo
           }),
         'count_records',
       ),
+  );
+
+  server.registerTool(
+    'conditional_bulk_update_records',
+    {
+      title: 'Conditional bulk update records',
+      description:
+        'Preview or update matching records without deleting anything. ' +
+        'Preview returns a matching count and sample IDs; apply mode updates in batches and returns compact counts.',
+      inputSchema: {
+        base_id: baseIdSchema,
+        table_id: tableIdSchema,
+        where: z.string().min(1).describe('NocoDB v3 where clause selecting the target records'),
+        fields_to_clear_or_update: recordSchema.describe(
+          'Fields to clear or update, e.g. { "Website Enrichment Status": null }',
+        ),
+        apply: z
+          .boolean()
+          .optional()
+          .describe('Set true to perform the update. Omit or false to preview only.'),
+        batch_size: z
+          .number()
+          .int()
+          .positive()
+          .max(MAX_BATCH_SIZE)
+          .optional()
+          .describe(`Batch size for apply mode (max ${MAX_BATCH_SIZE}, default 100)`),
+        sample_size: z
+          .number()
+          .int()
+          .positive()
+          .max(50)
+          .optional()
+          .describe('How many sample IDs to return in preview/apply summaries (default 10)'),
+      },
+    },
+    async ({ base_id, table_id, where, fields_to_clear_or_update, apply, batch_size, sample_size }) =>
+      tryTool(async () => {
+        const sampleSize = sample_size ?? DEFAULT_SAMPLE_SIZE;
+        const matchedBefore = await countMatchingRecords(client, base_id, table_id, where);
+        const sampleIds = await listMatchingRecordIds(client, base_id, table_id, where, sampleSize);
+        const auditBase = {
+          tool: 'conditional_bulk_update_records',
+          target: `${base_id}/${table_id}`,
+          preview_count: matchedBefore,
+        };
+
+        if (!apply) {
+          appendAuditLog({ ...auditBase, updated_count: 0 });
+          return {
+            ok: true,
+            preview_only: true,
+            matched_before: matchedBefore,
+            matched_after: matchedBefore,
+            updated_count: 0,
+            sample_ids: sampleIds,
+            changed_fields: fields_to_clear_or_update,
+            note: 'No changes were made. Re-run with apply=true to execute.',
+          };
+        }
+
+        const idsToUpdate = await listMatchingRecordIds(
+          client,
+          base_id,
+          table_id,
+          where,
+          Math.min(matchedBefore, MAX_ID_SCAN),
+        );
+        let updatedCount = 0;
+        const idsUpdatedSample: Array<string | number> = [];
+        const effectiveBatchSize = batch_size ?? 100;
+
+        for (const idChunk of chunkArray(idsToUpdate, effectiveBatchSize)) {
+          await client.request(`/data/${base_id}/${table_id}/records`, {
+            method: 'PATCH',
+            body: idChunk.map((id) => ({ Id: id, ...fields_to_clear_or_update })),
+          });
+          updatedCount += idChunk.length;
+          for (const id of idChunk) {
+            if (idsUpdatedSample.length < sampleSize) idsUpdatedSample.push(id);
+          }
+        }
+
+        const matchedAfter = await countMatchingRecords(client, base_id, table_id, where);
+        appendAuditLog({ ...auditBase, updated_count: updatedCount });
+        return {
+          ok: true,
+          preview_only: false,
+          matched_before: matchedBefore,
+          updated_count: updatedCount,
+          matched_after: matchedAfter,
+          sample_ids_updated: idsUpdatedSample,
+          changed_fields: fields_to_clear_or_update,
+          scan_capped: matchedBefore > MAX_ID_SCAN,
+        };
+      }, 'conditional_bulk_update_records'),
+  );
+
+  server.registerTool(
+    'update_records_compact',
+    {
+      title: 'Update records compact',
+      description:
+        'Update records by ID with a compact response that returns only IDs and changed fields, not full NocoDB row payloads.',
+      inputSchema: {
+        base_id: baseIdSchema,
+        table_id: tableIdSchema,
+        record_ids: z
+          .array(z.union([z.string(), z.number()]))
+          .min(1)
+          .describe('Record IDs to update'),
+        fields: recordSchema.describe('Fields to update on every selected record'),
+        apply: z
+          .boolean()
+          .optional()
+          .describe('Set true to perform the update. Omit or false to preview only.'),
+        batch_size: z
+          .number()
+          .int()
+          .positive()
+          .max(MAX_BATCH_SIZE)
+          .optional()
+          .describe(`Batch size for apply mode (max ${MAX_BATCH_SIZE}, default 100)`),
+      },
+    },
+    async ({ base_id, table_id, record_ids, fields, apply, batch_size }) =>
+      tryTool(async () => {
+        const sampleIds = record_ids.slice(0, DEFAULT_SAMPLE_SIZE);
+        const auditBase = {
+          tool: 'update_records_compact',
+          target: `${base_id}/${table_id}`,
+          preview_count: record_ids.length,
+        };
+
+        if (!apply) {
+          appendAuditLog({ ...auditBase, updated_count: 0 });
+          return {
+            ok: true,
+            preview_only: true,
+            matched_before: record_ids.length,
+            updated_count: 0,
+            ids: sampleIds,
+            changed_fields: fields,
+            note: 'No changes were made. Re-run with apply=true to execute.',
+          };
+        }
+
+        const effectiveBatchSize = batch_size ?? 100;
+        let updatedCount = 0;
+        for (const idChunk of chunkArray(record_ids, effectiveBatchSize)) {
+          await client.request(`/data/${base_id}/${table_id}/records`, {
+            method: 'PATCH',
+            body: idChunk.map((id) => ({ Id: id, ...fields })),
+          });
+          updatedCount += idChunk.length;
+        }
+
+        appendAuditLog({ ...auditBase, updated_count: updatedCount });
+        return {
+          ok: true,
+          preview_only: false,
+          matched_before: record_ids.length,
+          updated_count: updatedCount,
+          ids: record_ids,
+          changed_fields: fields,
+        };
+      }, 'update_records_compact'),
   );
 
   server.registerTool(

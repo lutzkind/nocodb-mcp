@@ -23,6 +23,7 @@ import { registerWebhookTools } from './tools/webhooks.js';
 import { registerWorkflowTools } from './tools/workflows.js';
 import { registerRecordHistoryTools } from './tools/history.js';
 import { registerWorkspaceTools } from './tools/workspaces.js';
+import { registerSchemaWriteTool } from './tools/schema-write.js';
 
 export const SERVER_VERSION = '1.0.4';
 
@@ -41,6 +42,7 @@ export function createServer(config: NocoDBConfig): McpServer {
   registerMetadataResolutionTools(server, client);
   registerTableTools(server, client);
   registerFieldTools(server, client);
+  registerSchemaWriteTool(server, client);
   registerRecordTools(server, client);
   registerViewTools(server, client);
   registerFilterTools(server, client);
