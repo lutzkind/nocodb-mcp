@@ -140,10 +140,7 @@ export async function applySchemaWrite(input: Record<string, unknown>, client: N
       if (existing) return { ok: true, applied: false, operation: 'create', table: compactTable(existing), idempotent: true, verification: { ok: true, mismatches: [] } };
       const preview = { preview_only: true, requested: { entity, operation, base_id: baseId, table_name: tableName }, affected_table: { name: tableName }, schema_field_count_before: 0, schema_field_count_after: 1 };
       if (!apply) return preview;
-      const created = await client.request<Table>(`/meta/bases/${encodeURIComponent(baseId)}/tables`, {
-        method: 'POST',
-        body: { title: tableName, fields: [{ title: 'Id', type: 'ID' }] },
-      });
+      const created = await client.request<Table>(`/meta/bases/${encodeURIComponent(baseId)}/tables`, { method: 'POST', body: { title: tableName } });
       const createdId = String(created.id ?? '');
       const table = createdId ? await client.request<Table>(`/meta/bases/${encodeURIComponent(baseId)}/tables/${encodeURIComponent(createdId)}`) : created;
       const verification = { ok: String(table.title ?? table.name ?? '') === tableName && Boolean(table.id ?? createdId), mismatches: [] as string[] };
