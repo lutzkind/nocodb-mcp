@@ -255,7 +255,7 @@ export function registerSchemaWriteTool(server: McpServer, client: NocoDBClient)
         entity: z.enum(['field', 'table']),
         operation: z.enum(['create', 'update', 'delete']),
         base_id: baseIdSchema,
-        table_id: tableIdSchema,
+        table_id: tableIdSchema.optional().describe('Required for field operations and disposable table deletion; omit when creating a disposable table.'),
         field_id: fieldIdSchema.optional(),
         field_name: z.string().min(1).optional(),
         field_type: z.enum(SAFE_FIELD_TYPES).optional(),
