@@ -121,6 +121,36 @@ function attachFullSchema(result: Record<string, unknown>, includeFullSchema: bo
   return includeFullSchema ? { ...result, before, after } : result;
 }
 
+async function inspectFieldDependencies(client: NocoDBClient, baseId: string, tableId: string, field: Field): Promise<Array<Record<string, unknown>>> {
+  const references: Array<Record<string, unknown>> = [];
+  const fieldId = String(field.id ?? field.field_id ?? '');
+  const name = fieldName(field);
+  const endpoints = [
+    ['view', `/meta/bases/${encodeURIComponent(baseId)}/tables/${encodeURIComponent(tableId)}/views`],
+    ['webhook', `/meta/bases/${encodeURIComponent(baseId)}/tables/${encodeURIComponent(tableId)}/webhooks`],
+    ['script', `/meta/bases/${encodeURIComponent(baseId)}/tables/${encodeURIComponent(tableId)}/scripts`],
+    ['workflow', `/meta/bases/${encodeURIComponent(baseId)}/tables/${encodeURIComponent(tableId)}/workflows`],
+  ] as const;
+  for (const [kind, endpoint] of endpoints) {
+    try {
+      const result = await client.request<unknown>(endpoint);
+      const rows: unknown[] = Array.isArray(result)
+        ? result
+        : (result && typeof result === 'object' && Array.isArray((result as Record<string, unknown>).list)
+          ? (result as Record<string, unknown>).list as unknown[]
+          : []);
+      for (const row of rows) {
+        const serialized = JSON.stringify(row);
+        const record = row && typeof row === 'object' ? row as Record<string, unknown> : {};
+        if (serialized.includes(name) || (fieldId && serialized.includes(fieldId))) references.push({ kind, identifier: record.id ?? record.uuid ?? null, detection: 'static', field: name });
+      }
+    } catch {
+      // Discovery is best-effort; unknown dynamic dependencies are reported separately.
+    }
+  }
+  return references;
+}
+
 export async function applySchemaWrite(input: Record<string, unknown>, client: NocoDBClient): Promise<Record<string, unknown>> {
   const entity = input.entity;
   const operation = input.operation;
@@ -215,7 +245,9 @@ export async function applySchemaWrite(input: Record<string, unknown>, client: N
     requested.expected_field_type = expectedType;
     const protection = protectionClass(current);
     if (protection) throw new Error(`refusing to delete protected ${protection} field`);
-    if (!apply) return { preview_only: true, requested, affected_field: compactField(current), schema_field_count_before: fields.length, schema_field_count_after: fields.length };
+    const dependencies = await inspectFieldDependencies(client, baseId, tableId, current);
+    if (dependencies.length > 0 && apply && input.high_risk_confirmation !== true) throw new Error(`ACTIVE_DEPENDENCY: field ${expectedName} is referenced by ${dependencies.map((dependency) => `${dependency.kind}:${String(dependency.identifier ?? 'unknown')}`).join(', ')}; pass high_risk_confirmation=true to override`);
+    if (!apply) return { preview_only: true, requested, affected_field: compactField(current), dependencies, schema_field_count_before: fields.length, schema_field_count_after: fields.length };
     await client.request(`/meta/bases/${encodeURIComponent(baseId)}/fields/${encodeURIComponent(fieldId)}`, { method: 'DELETE' });
     const reread = await client.request<Table>(tablePath);
     const stillPresent = schemaView(reread).some((field) => String(field.id ?? field.field_id ?? '') === fieldId);
@@ -261,6 +293,7 @@ export function registerSchemaWriteTool(server: McpServer, client: NocoDBClient)
         field_type: z.enum(SAFE_FIELD_TYPES).optional(),
         options: z.record(z.string(), z.unknown()).optional(),
         expected_field_type: z.string().min(1).optional(),
+        high_risk_confirmation: z.literal(true).optional().describe('Required only to override discovered active field dependencies.'),
         table_name: z.string().min(1).optional().describe('Disposable fixture table name with mcp_test_ or mcp_probe_ prefix.'),
         expected_table_name: z.string().min(1).optional().describe('Exact disposable table name required for deletion.'),
         include_full_schema: z.boolean().default(false).describe('Opt in to full before/after field arrays; default responses are compact.'),

@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import type { NocoDBClient } from '../client.js';
@@ -12,6 +13,27 @@ const AUDIT_LOG_PATH = '/tmp/nocodb-mcp-audit.jsonl';
 const MAX_BATCH_SIZE = 200;
 const MAX_ID_SCAN = 20000;
 const DEFAULT_SAMPLE_SIZE = 10;
+const MAX_GUARDED_RECORDS = 100;
+
+function mutationEnvelope(target: Record<string, unknown>, changed: boolean, verified: boolean, warnings: string[] = []) {
+  return {
+    requested_target: target,
+    applied_target: changed ? target : null,
+    changed,
+    verified,
+    warnings,
+    audit_id: crypto.randomUUID(),
+  };
+}
+
+function changedFields(before: Record<string, unknown>, after: Record<string, unknown>): Record<string, unknown> {
+  const diff: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(after)) {
+    if (key === 'Id') continue;
+    if (JSON.stringify(before[key]) !== JSON.stringify(value)) diff[key] = { before: before[key], after: value };
+  }
+  return diff;
+}
 
 function appendAuditLog(entry: Record<string, unknown>): void {
   fs.appendFileSync(
@@ -181,26 +203,106 @@ export function registerRecordTools(server: McpServer, client: NocoDBClient): vo
     {
       title: 'Update records (bulk)',
       description:
-        'Update one or more records. Each record MUST include its primary key (Id). ' +
-        'Only the included fields are updated.',
+        'Dry-run-first guarded update. Each record MUST include its exact primary key (Id). ' +
+        'Set apply=true to write; optional expected_values prevent stale overwrites. Maximum 100 records.',
       inputSchema: {
         base_id: baseIdSchema,
         table_id: tableIdSchema,
-        records: z
-          .array(recordSchema)
-          .min(1)
-          .describe('Array of records, each with primary key + fields to update'),
+        records: z.array(recordSchema).min(1).max(MAX_GUARDED_RECORDS),
+        expected_values: z.record(z.string(), z.unknown()).optional().describe('Values that must still match on every targeted record.'),
+        apply: z.boolean().optional().default(false),
       },
     },
-    async ({ base_id, table_id, records }) =>
-      tryTool(
-        () =>
-          client.request(`/data/${base_id}/${table_id}/records`, {
-            method: 'PATCH',
-            body: records,
-          }),
-        'update_records',
-      ),
+    async ({ base_id, table_id, records, expected_values, apply }) => tryTool(async () => {
+      const ids = records.map(recordIdValue);
+      if (ids.some((id) => id === null)) throw new Error('TARGET_MISMATCH: every record must include an exact Id primary key');
+      const current = await Promise.all(ids.map((id) => client.request<Record<string, unknown>>(`/data/${base_id}/${table_id}/records/${encodeURIComponent(String(id))}`)));
+      const previews = current.map((before, index) => ({ id: ids[index], changed_fields: changedFields(before, records[index]) }));
+      for (const before of current) {
+        for (const [key, value] of Object.entries(expected_values ?? {})) {
+          if (JSON.stringify(before[key]) !== JSON.stringify(value)) throw new Error(`STALE_REVISION: expected value for ${key} does not match record ${String(before.Id)}`);
+        }
+      }
+      if (!apply) return { ok: true, ...mutationEnvelope({ base_id, table_id, ids }, false, true), preview_only: true, previews, note: 'No changes were made. Re-run with apply=true.' };
+      await client.request(`/data/${base_id}/${table_id}/records`, { method: 'PATCH', body: records });
+      const after = await Promise.all(ids.map((id) => client.request<Record<string, unknown>>(`/data/${base_id}/${table_id}/records/${encodeURIComponent(String(id))}`)));
+      const verified = after.every((row, index) => Object.entries(records[index]).every(([key, value]) => key === 'Id' || JSON.stringify(row[key]) === JSON.stringify(value)));
+      if (!verified) throw new Error('POST_WRITE_VERIFICATION_FAILED: one or more records did not match the requested fields');
+      const envelope = mutationEnvelope({ base_id, table_id, ids }, true, true);
+      appendAuditLog({ tool: 'update_records', ...envelope });
+      return { ok: true, ...envelope, preview_only: false, previews, verified_records: after.map((row) => row.Id) };
+    }, 'update_records'),
+  );
+
+  server.registerTool(
+    'upsert_records',
+    {
+      title: 'Upsert records (guarded)',
+      description: 'Dry-run-first bounded upsert. Requires an explicit table and conflict key list; no filter-based matching.',
+      inputSchema: {
+        base_id: baseIdSchema,
+        table_id: tableIdSchema,
+        conflict_keys: z.array(z.string().min(1)).min(1).max(8),
+        records: z.array(recordSchema).min(1).max(MAX_GUARDED_RECORDS),
+        apply: z.boolean().optional().default(false),
+      },
+    },
+    async ({ base_id, table_id, conflict_keys, records, apply }) => tryTool(async () => {
+      const target = { base_id, table_id, conflict_keys, count: records.length };
+      if (!apply) return { ok: true, ...mutationEnvelope(target, false, true), preview_only: true, records, note: 'No changes were made. Re-run with apply=true.' };
+      const result = await client.request<unknown>(`/data/${base_id}/${table_id}/records/upsert`, {
+        method: 'POST',
+        body: { records, conflict_keys },
+      });
+      const resultRows = Array.isArray(result)
+        ? result
+        : result && typeof result === 'object' && Array.isArray((result as Record<string, unknown>).list)
+          ? (result as Record<string, unknown>).list as unknown[]
+          : [];
+      const returnedIds = resultRows
+        .filter((row): row is Record<string, unknown> => Boolean(row && typeof row === 'object'))
+        .map(recordIdValue)
+        .filter((id): id is string | number => id !== null);
+      if (returnedIds.length !== records.length) {
+        throw new Error('POST_WRITE_VERIFICATION_FAILED: upsert did not return one exact record identity per requested row');
+      }
+      const verifiedRows = await Promise.all(returnedIds.map((id) => client.request<Record<string, unknown>>(`/data/${base_id}/${table_id}/records/${encodeURIComponent(String(id))}`)));
+      const verified = verifiedRows.every((row, index) => conflict_keys.every((key) => JSON.stringify(row[key]) === JSON.stringify(resultRows[index][key])));
+      if (!verified) throw new Error('POST_WRITE_VERIFICATION_FAILED: upsert conflict keys did not match the returned records');
+      const envelope = mutationEnvelope(target, true, true);
+      appendAuditLog({ tool: 'upsert_records', ...envelope });
+      return { ok: true, ...envelope, preview_only: false, result };
+    }, 'upsert_records'),
+  );
+
+  server.registerTool(
+    'delete_records_guarded',
+    {
+      title: 'Delete records (guarded)',
+      description: 'Dry-run-first exact-ID deletion. Broad filters and unbounded deletion are not accepted.',
+      inputSchema: {
+        base_id: baseIdSchema,
+        table_id: tableIdSchema,
+        record_ids: z.array(z.union([z.string(), z.number()])).min(1).max(MAX_GUARDED_RECORDS),
+        expected_values: z.record(z.string(), z.unknown()).optional(),
+        apply: z.boolean().optional().default(false),
+      },
+    },
+    async ({ base_id, table_id, record_ids, expected_values, apply }) => tryTool(async () => {
+      const target = { base_id, table_id, record_ids };
+      const current = await Promise.all(record_ids.map((id) => client.request<Record<string, unknown>>(`/data/${base_id}/${table_id}/records/${encodeURIComponent(String(id))}`)));
+      for (const row of current) for (const [key, value] of Object.entries(expected_values ?? {})) if (JSON.stringify(row[key]) !== JSON.stringify(value)) throw new Error(`STALE_REVISION: expected value for ${key} does not match record ${String(row.Id)}`);
+      if (!apply) return { ok: true, ...mutationEnvelope(target, false, true), preview_only: true, matched: current.map((row) => row.Id), note: 'No changes were made. Re-run with apply=true.' };
+      await client.request(`/data/${base_id}/${table_id}/records`, { method: 'DELETE', body: record_ids.map((id) => ({ Id: id })) });
+      const remaining = [];
+      for (const id of record_ids) {
+        try { await client.request(`/data/${base_id}/${table_id}/records/${encodeURIComponent(String(id))}`); remaining.push(id); } catch { /* expected absence */ }
+      }
+      if (remaining.length) throw new Error(`POST_WRITE_VERIFICATION_FAILED: records remain after deletion: ${remaining.join(',')}`);
+      const envelope = mutationEnvelope(target, true, true);
+      appendAuditLog({ tool: 'delete_records_guarded', ...envelope });
+      return { ok: true, ...envelope, preview_only: false, deleted: record_ids };
+    }, 'delete_records_guarded'),
   );
 
   server.registerTool(
@@ -238,30 +340,6 @@ export function registerRecordTools(server: McpServer, client: NocoDBClient): vo
         'delete_records',
       );
     },
-  );
-
-  server.registerTool(
-    'upsert_records',
-    {
-      title: 'Upsert records',
-      description:
-        'Insert records, or update them if a record with the same primary key already exists. ' +
-        'Useful for idempotent imports.',
-      inputSchema: {
-        base_id: baseIdSchema,
-        table_id: tableIdSchema,
-        records: z.array(recordSchema).min(1),
-      },
-    },
-    async ({ base_id, table_id, records }) =>
-      tryTool(
-        () =>
-          client.request(`/data/${base_id}/${table_id}/records/upsert`, {
-            method: 'POST',
-            body: records,
-          }),
-        'upsert_records',
-      ),
   );
 
   server.registerTool(
