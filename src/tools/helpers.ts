@@ -29,6 +29,8 @@ export function fail(err: unknown, context?: string): ToolResponse {
     payload.details = err.body;
   } else if (err instanceof Error) {
     payload.error = err.message;
+    const errorCode = (err as Error & { code?: unknown }).code;
+    if (typeof errorCode === 'string') payload.error_code = errorCode;
   } else {
     payload.error = String(err);
   }

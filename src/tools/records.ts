@@ -15,6 +15,90 @@ const MAX_ID_SCAN = 20000;
 const DEFAULT_SAMPLE_SIZE = 10;
 const MAX_GUARDED_RECORDS = 100;
 
+export class TargetIdentityMismatch extends Error {
+  readonly code = 'TARGET_IDENTITY_MISMATCH';
+
+  constructor(message: string) {
+    super(message);
+    this.name = 'TargetIdentityMismatch';
+  }
+}
+
+interface ConditionalBulkUpdateInput {
+  base_id: string;
+  table_id: string;
+  where: string;
+  fields_to_clear_or_update: Record<string, unknown>;
+  apply?: boolean;
+  batch_size?: number;
+  sample_size?: number;
+  request_id?: string;
+  preview_token?: string;
+}
+
+interface ConditionalBulkPreview {
+  request_id: string;
+  base_id: string;
+  table_id: string;
+  where: string;
+  fields_digest: string;
+  batch_size: number;
+  sample_size: number;
+  ids: Array<string | number>;
+  target_digest: string;
+  expires_at: number;
+}
+
+const conditionalBulkPreviews = new Map<string, ConditionalBulkPreview>();
+
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value as Record<string, unknown>).sort().map((key) => `${JSON.stringify(key)}:${stableJson((value as Record<string, unknown>)[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function digest(value: unknown): string {
+  return crypto.createHash('sha256').update(stableJson(value)).digest('hex');
+}
+
+function requestIdFor(value: string | undefined, required: boolean): string {
+  if (value !== undefined) {
+    const requestId = value.trim();
+    if (!/^[A-Za-z0-9._:-]{8,128}$/.test(requestId)) throw new TargetIdentityMismatch('request_id is invalid');
+    return requestId;
+  }
+  if (required) throw new TargetIdentityMismatch('request_id is required when applying a preview token');
+  return crypto.randomUUID();
+}
+
+function identityDigest(input: Pick<ConditionalBulkUpdateInput, 'base_id' | 'table_id' | 'where' | 'fields_to_clear_or_update'>, batchSize: number, sampleSize: number): string {
+  return digest({ base_id: input.base_id, table_id: input.table_id, where: input.where, fields: input.fields_to_clear_or_update, batch_size: batchSize, sample_size: sampleSize });
+}
+
+function idDigest(ids: Array<string | number>): string {
+  return digest(ids.map((id) => `${typeof id}:${String(id)}`));
+}
+
+function previewFor(token: string): ConditionalBulkPreview {
+  const preview = conditionalBulkPreviews.get(token);
+  if (!preview || preview.expires_at < Date.now()) {
+    if (preview) conditionalBulkPreviews.delete(token);
+    throw new TargetIdentityMismatch('preview token is missing or expired');
+  }
+  return preview;
+}
+
+function claimPreview(token: string, requestId: string): ConditionalBulkPreview {
+  const preview = previewFor(token);
+  if (preview.request_id !== requestId) throw new TargetIdentityMismatch('preview token does not match request_id');
+  // Map deletion is synchronous and occurs before the first await. This makes
+  // the capability single-use under interleaved concurrent apply requests.
+  conditionalBulkPreviews.delete(token);
+  return preview;
+}
+
 function mutationEnvelope(target: Record<string, unknown>, changed: boolean, verified: boolean, warnings: string[] = []) {
   return {
     requested_target: target,
@@ -110,6 +194,115 @@ async function listMatchingRecordIds(
   }
 
   return ids;
+}
+
+export async function runConditionalBulkUpdate(input: ConditionalBulkUpdateInput, client: NocoDBClient): Promise<Record<string, unknown>> {
+  const sampleSize = input.sample_size ?? DEFAULT_SAMPLE_SIZE;
+  const effectiveBatchSize = input.batch_size ?? 100;
+  const auditBase = {
+    tool: 'conditional_bulk_update_records',
+    request_id: input.request_id ?? null,
+    requested_target: `${input.base_id}/${input.table_id}`,
+    resolved_target: `${input.base_id}/${input.table_id}`,
+    applied_target: null,
+    verified_target: null,
+    expected_hash: null,
+    current_hash: null,
+    new_hash: null,
+    outcome: input.apply ? 'apply_started' : 'preview',
+  };
+
+  if (!input.apply) {
+    const requestId = requestIdFor(input.request_id, false);
+    const matchedBefore = await countMatchingRecords(client, input.base_id, input.table_id, input.where);
+    if (matchedBefore > MAX_ID_SCAN) throw new TargetIdentityMismatch(`target set exceeds exact binding limit of ${MAX_ID_SCAN} records`);
+    const ids = await listMatchingRecordIds(client, input.base_id, input.table_id, input.where, matchedBefore);
+    if (ids.length !== matchedBefore) throw new TargetIdentityMismatch('target set changed during preview; exact target identity could not be bound');
+    const token = crypto.randomBytes(24).toString('hex');
+    const preview: ConditionalBulkPreview = {
+      request_id: requestId,
+      base_id: input.base_id,
+      table_id: input.table_id,
+      where: input.where,
+      fields_digest: digest(input.fields_to_clear_or_update),
+      batch_size: effectiveBatchSize,
+      sample_size: sampleSize,
+      ids,
+      target_digest: idDigest(ids),
+      expires_at: Date.now() + 15 * 60 * 1000,
+    };
+    conditionalBulkPreviews.set(token, preview);
+    while (conditionalBulkPreviews.size > 256) conditionalBulkPreviews.delete(conditionalBulkPreviews.keys().next().value as string);
+    appendAuditLog({ ...auditBase, request_id: requestId, preview_token_hash: digest(token), target_digest: preview.target_digest, preview_count: ids.length, updated_count: 0, outcome: 'preview_created' });
+    return {
+      ok: true,
+      preview_only: true,
+      request_id: requestId,
+      preview_token: token,
+      preview_digest: preview.target_digest,
+      requested_target: `${input.base_id}/${input.table_id}`,
+      matched_before: matchedBefore,
+      matched_after: matchedBefore,
+      updated_count: 0,
+      target_ids_bound: ids.length,
+      sample_ids: ids.slice(0, sampleSize),
+      changed_fields: input.fields_to_clear_or_update,
+      note: 'No changes were made. Re-run with apply=true, the returned request_id, and the exact preview_token within 15 minutes.',
+    };
+  }
+
+  const requestId = requestIdFor(input.request_id, true);
+  const token = String(input.preview_token ?? '');
+  if (!token) throw new TargetIdentityMismatch('preview_token is required when applying a conditional bulk update');
+  const candidate = previewFor(token);
+  const candidateDigest = identityDigest(input, effectiveBatchSize, sampleSize);
+  const expectedDigest = identityDigest({ ...input, fields_to_clear_or_update: input.fields_to_clear_or_update }, candidate.batch_size, candidate.sample_size);
+  if (candidate.request_id !== requestId || candidate.base_id !== input.base_id || candidate.table_id !== input.table_id || candidate.where !== input.where || candidate.fields_digest !== digest(input.fields_to_clear_or_update) || candidate.batch_size !== effectiveBatchSize || candidate.sample_size !== sampleSize) {
+    throw new TargetIdentityMismatch(`preview target binding differs (requested=${candidateDigest.slice(0, 12)}, preview=${expectedDigest.slice(0, 12)})`);
+  }
+  const saved = claimPreview(token, requestId);
+  const matchedBefore = await countMatchingRecords(client, saved.base_id, saved.table_id, saved.where);
+  const currentIds = await listMatchingRecordIds(client, saved.base_id, saved.table_id, saved.where, saved.ids.length);
+  if (matchedBefore !== saved.ids.length || currentIds.length !== saved.ids.length || idDigest(currentIds) !== saved.target_digest) {
+    appendAuditLog({ ...auditBase, request_id: requestId, preview_token_hash: digest(token), target_digest: saved.target_digest, current_target_digest: idDigest(currentIds), preview_count: saved.ids.length, current_count: matchedBefore, outcome: 'error', error_code: 'TARGET_IDENTITY_MISMATCH' });
+    throw new TargetIdentityMismatch('target ID set changed after preview; no records were mutated');
+  }
+
+  let updatedCount = 0;
+  const idsUpdatedSample: Array<string | number> = [];
+  for (const idChunk of chunkArray(saved.ids, saved.batch_size)) {
+    await client.request(`/data/${saved.base_id}/${saved.table_id}/records`, {
+      method: 'PATCH',
+      body: idChunk.map((id) => ({ Id: id, ...input.fields_to_clear_or_update })),
+    });
+    updatedCount += idChunk.length;
+    idsUpdatedSample.push(...idChunk.slice(0, Math.max(0, sampleSize - idsUpdatedSample.length)));
+  }
+
+  const verifiedRows = await Promise.all(saved.ids.map((id) => client.request<Record<string, unknown>>(`/data/${saved.base_id}/${saved.table_id}/records/${encodeURIComponent(String(id))}`)));
+  const verified = verifiedRows.every((row) => Object.entries(input.fields_to_clear_or_update).every(([key, value]) => JSON.stringify(row[key]) === JSON.stringify(value)));
+  if (!verified) {
+    appendAuditLog({ ...auditBase, request_id: requestId, preview_token_hash: digest(token), target_digest: saved.target_digest, applied_target: `${saved.base_id}/${saved.table_id}`, outcome: 'error', error_code: 'POST_WRITE_VERIFICATION_FAILED' });
+    throw new Error('POST_WRITE_VERIFICATION_FAILED: one or more records did not match the requested fields');
+  }
+  const matchedAfter = await countMatchingRecords(client, saved.base_id, saved.table_id, saved.where);
+  appendAuditLog({ ...auditBase, request_id: requestId, preview_token_hash: digest(token), target_digest: saved.target_digest, applied_target: `${saved.base_id}/${saved.table_id}`, verified_target: `${saved.base_id}/${saved.table_id}`, preview_count: saved.ids.length, updated_count: updatedCount, current_count: matchedAfter, outcome: 'success' });
+  return {
+    ok: true,
+    preview_only: false,
+    request_id: requestId,
+    preview_token: token,
+    preview_digest: saved.target_digest,
+    requested_target: `${saved.base_id}/${saved.table_id}`,
+    applied_target: `${saved.base_id}/${saved.table_id}`,
+    verified_target: `${saved.base_id}/${saved.table_id}`,
+    matched_before: matchedBefore,
+    updated_count: updatedCount,
+    matched_after: matchedAfter,
+    sample_ids_updated: idsUpdatedSample,
+    changed_fields: input.fields_to_clear_or_update,
+    verified,
+  };
 }
 
 export function registerRecordTools(server: McpServer, client: NocoDBClient): void {
@@ -371,8 +564,7 @@ export function registerRecordTools(server: McpServer, client: NocoDBClient): vo
     {
       title: 'Conditional bulk update records',
       description:
-        'Preview or update matching records without deleting anything. ' +
-        'Preview returns a matching count and sample IDs; apply mode updates in batches and returns compact counts.',
+        'Preview or update matching records without deleting anything. Apply requires the exact single-use preview token, request ID, target, filter, patch, and unchanged target ID set from preview.',
       inputSchema: {
         base_id: baseIdSchema,
         table_id: tableIdSchema,
@@ -380,86 +572,14 @@ export function registerRecordTools(server: McpServer, client: NocoDBClient): vo
         fields_to_clear_or_update: recordSchema.describe(
           'Fields to clear or update, e.g. { "Website Enrichment Status": null }',
         ),
-        apply: z
-          .boolean()
-          .optional()
-          .describe('Set true to perform the update. Omit or false to preview only.'),
-        batch_size: z
-          .number()
-          .int()
-          .positive()
-          .max(MAX_BATCH_SIZE)
-          .optional()
-          .describe(`Batch size for apply mode (max ${MAX_BATCH_SIZE}, default 100)`),
-        sample_size: z
-          .number()
-          .int()
-          .positive()
-          .max(50)
-          .optional()
-          .describe('How many sample IDs to return in preview/apply summaries (default 10)'),
+        apply: z.boolean().optional().describe('Set true to perform the update. Omit or false to preview only.'),
+        batch_size: z.number().int().positive().max(MAX_BATCH_SIZE).optional().describe(`Batch size for apply mode (max ${MAX_BATCH_SIZE}, default 100)`),
+        sample_size: z.number().int().positive().max(50).optional().describe('How many sample IDs to return in preview/apply summaries (default 10)'),
+        request_id: z.string().regex(/^[A-Za-z0-9._:-]{8,128}$/).optional().describe('Request binding ID returned by preview; required for apply.'),
+        preview_token: z.string().regex(/^[a-f0-9]{48}$/i).optional().describe('Single-use exact-target preview capability.'),
       },
     },
-    async ({ base_id, table_id, where, fields_to_clear_or_update, apply, batch_size, sample_size }) =>
-      tryTool(async () => {
-        const sampleSize = sample_size ?? DEFAULT_SAMPLE_SIZE;
-        const matchedBefore = await countMatchingRecords(client, base_id, table_id, where);
-        const sampleIds = await listMatchingRecordIds(client, base_id, table_id, where, sampleSize);
-        const auditBase = {
-          tool: 'conditional_bulk_update_records',
-          target: `${base_id}/${table_id}`,
-          preview_count: matchedBefore,
-        };
-
-        if (!apply) {
-          appendAuditLog({ ...auditBase, updated_count: 0 });
-          return {
-            ok: true,
-            preview_only: true,
-            matched_before: matchedBefore,
-            matched_after: matchedBefore,
-            updated_count: 0,
-            sample_ids: sampleIds,
-            changed_fields: fields_to_clear_or_update,
-            note: 'No changes were made. Re-run with apply=true to execute.',
-          };
-        }
-
-        const idsToUpdate = await listMatchingRecordIds(
-          client,
-          base_id,
-          table_id,
-          where,
-          Math.min(matchedBefore, MAX_ID_SCAN),
-        );
-        let updatedCount = 0;
-        const idsUpdatedSample: Array<string | number> = [];
-        const effectiveBatchSize = batch_size ?? 100;
-
-        for (const idChunk of chunkArray(idsToUpdate, effectiveBatchSize)) {
-          await client.request(`/data/${base_id}/${table_id}/records`, {
-            method: 'PATCH',
-            body: idChunk.map((id) => ({ Id: id, ...fields_to_clear_or_update })),
-          });
-          updatedCount += idChunk.length;
-          for (const id of idChunk) {
-            if (idsUpdatedSample.length < sampleSize) idsUpdatedSample.push(id);
-          }
-        }
-
-        const matchedAfter = await countMatchingRecords(client, base_id, table_id, where);
-        appendAuditLog({ ...auditBase, updated_count: updatedCount });
-        return {
-          ok: true,
-          preview_only: false,
-          matched_before: matchedBefore,
-          updated_count: updatedCount,
-          matched_after: matchedAfter,
-          sample_ids_updated: idsUpdatedSample,
-          changed_fields: fields_to_clear_or_update,
-          scan_capped: matchedBefore > MAX_ID_SCAN,
-        };
-      }, 'conditional_bulk_update_records'),
+    async (input) => tryTool(() => runConditionalBulkUpdate(input, client), 'conditional_bulk_update_records'),
   );
 
   server.registerTool(
