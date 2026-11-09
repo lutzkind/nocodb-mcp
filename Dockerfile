@@ -22,6 +22,11 @@ RUN npm run build
 FROM node:20-slim AS runtime
 WORKDIR /app
 
+# CVE-2026-111497: install the fixed libbrotli1 runtime.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libbrotli1 \
+    && rm -rf /var/lib/apt/lists/*
+
 ENV NODE_ENV=production
 # Listen on all interfaces inside the container so the host / reverse proxy
 # can reach the port. Override at runtime with -e HOST=... if needed.
